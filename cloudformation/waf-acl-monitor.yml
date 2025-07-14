@@ -2,17 +2,6 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: 'AWS WAF ACL Monitor - Sistema de alertas para cambios en ACLs WAF'
 
 Parameters:
-  MonitoringInterval:
-    Type: Number
-    Description: 'Intervalo de monitoreo en minutos'
-    Default: 5
-    AllowedValues:
-      - 1
-      - 5
-      - 10
-      - 30
-      - 60
-    ConstraintDescription: 'Debe ser 1, 5, 10, 30 o 60 minutos'
   Region:
     Type: String
     Description: 'Región AWS donde se desplegarán los recursos'
@@ -37,19 +26,6 @@ Parameters:
     Type: String
     Description: 'Nombre de la tabla DynamoDB para historial de cambios de ACLs'
     Default: 'waf-acl-monitor-history'
-
-Mappings:
-  PeriodMap:
-    "1":
-      Value: 60
-    "5":
-      Value: 300
-    "10":
-      Value: 600
-    "30":
-      Value: 1800
-    "60":
-      Value: 3600
 
 Resources:
   WAFACLAlertsTopic:
@@ -109,6 +85,7 @@ Resources:
                   - dynamodb:PutItem
                   - dynamodb:GetItem
                   - dynamodb:Query
+                  - cloudtrail:LookupEvents
                 Resource: '*'
 
   WAFMonitorFunction:
@@ -124,7 +101,6 @@ Resources:
         Variables:
           SNS_TOPIC_ARN: !Ref WAFACLAlertsTopic
           LOG_GROUP_NAME: !Ref WAFMonitorLogGroup
-          MONITORING_INTERVAL: !Ref MonitoringInterval
           REGION: !Ref Region
           AWS_STACK_NAME: !Ref AWS::StackName
           DYNAMODB_TABLE: !Ref DynamoDBTableName
@@ -139,303 +115,169 @@ Resources:
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
-          def get_account_id():
-              sts = boto3.client('sts')
-              return sts.get_caller_identity()['Account']
-
-          def get_previous_state(dynamodb, table_name, account_id):
+          def get_previous_acl_state(dynamodb, table_name, acl_id):
               try:
-                  resp = dynamodb.query(
+                  resp = dynamodb.get_item(
                       TableName=table_name,
-                      KeyConditionExpression='account_id = :aid',
-                      ExpressionAttributeValues={':aid': {'S': account_id}},
-                      ScanIndexForward=False,
-                      Limit=1
+                      Key={
+                          'account_id': {'S': 'STATE'},
+                          'timestamp': {'S': acl_id}
+                      }
                   )
-                  items = resp.get('Items', [])
-                  if items:
-                      state = json.loads(items[0]['new_state']['S'])
-                      # Limpiar el estado anterior también
-                      return clean_for_json(state)
+                  item = resp.get('Item')
+                  if item and 'acl_state' in item:
+                      return json.loads(item['acl_state']['S'])
                   return None
               except Exception as e:
-                  logger.error(f"Error leyendo estado anterior: {e}")
+                  logger.error(f"Error leyendo estado anterior de ACL {acl_id}: {e}")
                   return None
 
-          def save_state(dynamodb, table_name, account_id, timestamp, old_state, new_state, change_type, details):
-              item = {
-                  'account_id': {'S': account_id},
-                  'timestamp': {'S': timestamp},
-                  'old_state': {'S': json.dumps(old_state) if old_state else ''},
-                  'new_state': {'S': json.dumps(new_state)},
-                  'change_type': {'S': change_type},
-                  'details': {'S': json.dumps(details)}
-              }
-              dynamodb.put_item(TableName=table_name, Item=item)
-
-          def clean_for_json(obj):
-              """Limpia objetos para serialización JSON, convirtiendo bytes a strings"""
-              if isinstance(obj, dict):
-                  return {k: clean_for_json(v) for k, v in obj.items()}
-              elif isinstance(obj, list):
-                  return [clean_for_json(item) for item in obj]
-              elif isinstance(obj, bytes):
-                  return obj.decode('utf-8', errors='ignore')
-              elif isinstance(obj, (int, float, str, bool, type(None))):
-                  return obj
-              else:
-                  return str(obj)
-
-          def get_web_acl_details(wafv2, acl_id, acl_name, scope):
-              """Obtiene los detalles completos de un ACL usando get_web_acl"""
+          def save_acl_state(dynamodb, table_name, acl_id, acl_state):
               try:
-                  response = wafv2.get_web_acl(
-                      Name=acl_name,
-                      Scope=scope,
-                      Id=acl_id
+                  dynamodb.put_item(
+                      TableName=table_name,
+                      Item={
+                          'account_id': {'S': 'STATE'},
+                          'timestamp': {'S': acl_id},
+                          'acl_state': {'S': json.dumps(acl_state)}
+                      }
                   )
-                  # Limpiar la respuesta para JSON
-                  return clean_for_json(response['WebACL'])
               except Exception as e:
-                  logger.error(f"Error obteniendo detalles del ACL {acl_name}: {e}")
-                  return None
+                  logger.error(f"Error guardando estado de ACL {acl_id}: {e}")
 
-          def get_all_web_acls_with_details(wafv2, scope):
-              """Obtiene todos los ACLs con sus detalles completos"""
-              try:
-                  # Primero obtener la lista de ACLs
-                  response = wafv2.list_web_acls(Scope=scope)
-                  acls = response.get('WebACLs', [])
-                  
-                  # Obtener detalles completos de cada ACL
-                  detailed_acls = []
-                  for acl in acls:
-                      details = get_web_acl_details(wafv2, acl['Id'], acl['Name'], scope)
-                      if details:
-                          detailed_acls.append(details)
-                      else:
-                          # Si no se pueden obtener detalles, usar la información básica
-                          detailed_acls.append(acl)
-                  
-                  return detailed_acls
-              except Exception as e:
-                  logger.error(f"Error obteniendo ACLs {scope}: {e}")
-                  return []
-
-          def describe_acl_changes(old_acls, new_acls):
-              """Describe los cambios entre dos conjuntos de ACLs"""
+          def diff_rules(old_rules, new_rules):
+              old_dict = {r['name']: r for r in old_rules} if old_rules else {}
+              new_dict = {r['name']: r for r in new_rules} if new_rules else {}
               changes = []
-              old_acls_dict = {acl['Name']: acl for acl in old_acls} if old_acls else {}
-              new_acls_dict = {acl['Name']: acl for acl in new_acls} if new_acls else {}
-
-              # ACLs agregadas
-              for name in new_acls_dict:
-                  if name not in old_acls_dict:
-                      changes.append(f"ACL agregada: {name}")
-
-              # ACLs eliminadas
-              for name in old_acls_dict:
-                  if name not in new_acls_dict:
-                      changes.append(f"ACL eliminada: {name}")
-
-              # ACLs modificadas
-              for name in new_acls_dict:
-                  if name in old_acls_dict:
-                      acl_changes = []
-                      old_acl = old_acls_dict[name]
-                      new_acl = new_acls_dict[name]
-
-                      # Comparar reglas
-                      old_rules = {r['Name']: r for r in old_acl.get('Rules', [])}
-                      new_rules = {r['Name']: r for r in new_acl.get('Rules', [])}
-
-                      # Reglas agregadas
-                      for rule_name in new_rules:
-                          if rule_name not in old_rules:
-                              acl_changes.append(f"  - Regla agregada: {rule_name}")
-                              
-                      # Reglas eliminadas
-                      for rule_name in old_rules:
-                          if rule_name not in new_rules:
-                              acl_changes.append(f"  - Regla eliminada: {rule_name}")
-                              
-                      # Reglas modificadas
-                      for rule_name in new_rules:
-                          if rule_name in old_rules:
-                              old_rule = old_rules[rule_name]
-                              new_rule = new_rules[rule_name]
-                              
-                              # Comparar reglas en detalle
-                              if old_rule != new_rule:
-                                  rule_changes = []
-                                  
-                                  # Cambios en Statement
-                                  if old_rule.get('Statement') != new_rule.get('Statement'):
-                                      rule_changes.append("Statement modificado")
-                                  
-                                  # Cambios en Action
-                                  if old_rule.get('Action') != new_rule.get('Action'):
-                                      rule_changes.append("Action modificado")
-                                  
-                                  # Cambios en Priority
-                                  if old_rule.get('Priority') != new_rule.get('Priority'):
-                                      rule_changes.append(f"Priority cambiado: {old_rule.get('Priority')} -> {new_rule.get('Priority')}")
-                                  
-                                  # Cambios en RateBasedStatement
-                                  old_rate = old_rule.get('Statement', {}).get('RateBasedStatement', {})
-                                  new_rate = new_rule.get('Statement', {}).get('RateBasedStatement', {})
-                                  if old_rate.get('Limit') != new_rate.get('Limit'):
-                                      rule_changes.append(f"Rate limit cambiado: {old_rate.get('Limit')} -> {new_rate.get('Limit')}")
-                                  
-                                  # Cambios en ManagedRuleGroupStatement
-                                  old_managed = old_rule.get('Statement', {}).get('ManagedRuleGroupStatement', {})
-                                  new_managed = new_rule.get('Statement', {}).get('ManagedRuleGroupStatement', {})
-                                  if old_managed != new_managed:
-                                      rule_changes.append("ManagedRuleGroupStatement modificado")
-                                  
-                                  # Cambios en RuleGroupReferenceStatement
-                                  old_ref = old_rule.get('Statement', {}).get('RuleGroupReferenceStatement', {})
-                                  new_ref = new_rule.get('Statement', {}).get('RuleGroupReferenceStatement', {})
-                                  if old_ref != new_ref:
-                                      rule_changes.append("RuleGroupReferenceStatement modificado")
-                                  
-                                  if rule_changes:
-                                      acl_changes.append(f"  - Regla modificada: {rule_name}")
-                                      acl_changes.extend([f"    * {change}" for change in rule_changes])
-
-                      # Cambios en DefaultAction
-                      if old_acl.get('DefaultAction') != new_acl.get('DefaultAction'):
-                          old_action = old_acl.get('DefaultAction', {})
-                          new_action = new_acl.get('DefaultAction', {})
-                          acl_changes.append(f"  - DefaultAction cambiado: {old_action} -> {new_action}")
-
-                      # Cambios en Description
-                      if old_acl.get('Description') != new_acl.get('Description'):
-                          acl_changes.append(f"  - Descripción cambiada: {old_acl.get('Description')} -> {new_acl.get('Description')}")
-
-                      # Cambios en VisibilityConfig
-                      old_visibility = old_acl.get('VisibilityConfig', {})
-                      new_visibility = new_acl.get('VisibilityConfig', {})
-                      if old_visibility != new_visibility:
-                          acl_changes.append("  - VisibilityConfig modificado")
-
-                      if acl_changes:
-                          changes.append(f"ACL modificada: {name}\n" + "\n".join(acl_changes))
-              
+              # Agregadas
+              for name in new_dict:
+                  if name not in old_dict:
+                      changes.append(f"Regla agregada: {name}")
+              # Eliminadas
+              for name in old_dict:
+                  if name not in new_dict:
+                      changes.append(f"Regla eliminada: {name}")
+              # Modificadas
+              for name in new_dict:
+                  if name in old_dict and new_dict[name] != old_dict[name]:
+                      changes.append(f"Regla modificada: {name}")
               return changes
 
-          def compare_states(old, new):
-              if not old:
-                  return True, 'initial', {'message': 'Primera ejecución'}
-              
-              changes = []
-              # Regional
-              changes += describe_acl_changes(old.get('regional_acls', []), new.get('regional_acls', []))
-              # Global
-              changes += describe_acl_changes(old.get('global_acls', []), new.get('global_acls', []))
-              
-              if changes:
-                  return True, 'changed', {'changes': changes}
-              return False, 'no_change', {'message': 'Sin cambios'}
-
           def lambda_handler(event, context):
-              logger.info("INICIO LAMBDA")
+              logger.info("INICIO LAMBDA (triggered by CloudTrail event)")
               try:
                   region = os.environ.get('REGION', 'us-east-1')
                   sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
                   table_name = os.environ.get('DYNAMODB_TABLE')
-
-                  wafv2 = boto3.client('wafv2', region_name=region)
-                  sns = boto3.client('sns', region_name=region)
                   dynamodb = boto3.client('dynamodb', region_name=region)
+                  sns = boto3.client('sns', region_name=region)
 
-                  account_id = get_account_id()
-                  timestamp = datetime.now(timezone.utc).isoformat()
+                  # El evento CloudTrail viene en event['detail']
+                  detail = event.get('detail', {})
+                  event_name = detail.get('eventName', 'Desconocido')
+                  event_time = detail.get('eventTime', datetime.now(timezone.utc).isoformat())
+                  user_identity = detail.get('userIdentity', {})
+                  request_params = detail.get('requestParameters', {})
+                  response_elements = detail.get('responseElements', {})
 
-                  # Obtener ACLs regionales con detalles completos
-                  logger.info("Obteniendo ACLs regionales con detalles...")
-                  regional_acls = get_all_web_acls_with_details(wafv2, 'REGIONAL')
+                  # Extraer info de usuario (incluyendo federado SSO)
+                  arn = user_identity.get('arn', '')
+                  principal_id = user_identity.get('principalId', '')
+                  user_type = user_identity.get('type', '')
+                  if user_type == 'AssumedRole' and 'AWSReservedSSO' in arn:
+                      session_issuer = user_identity.get('sessionContext', {}).get('sessionIssuer', {})
+                      sso_user = arn.split('/')[-1]
+                      sso_role = session_issuer.get('userName', 'Desconocido')
+                      user_display = f"federado: {sso_user} (rol: {sso_role})"
+                  else:
+                      user_display = arn or principal_id or 'Desconocido'
 
-                  # Obtener ACLs globales con detalles completos (solo en us-east-1)
-                  global_acls = []
-                  if region == 'us-east-1':
-                      logger.info("Obteniendo ACLs globales con detalles...")
-                      global_acls = get_all_web_acls_with_details(wafv2, 'CLOUDFRONT')
+                  # Extraer info del ACL
+                  acl_name = request_params.get('name') or request_params.get('Name') or 'Desconocido'
+                  acl_id = request_params.get('id') or request_params.get('Id') or 'Desconocido'
+                  acl_scope = request_params.get('scope') or request_params.get('Scope') or 'REGIONAL'
+                  acl_arn = None
+                  # Buscar ARN en responseElements si está
+                  if response_elements:
+                      acl_arn = response_elements.get('summary', {}).get('ARN') or response_elements.get('webACL', {}).get('ARN')
+                  if not acl_arn and 'resources' in detail:
+                      # A veces CloudTrail pone el ARN en resources
+                      for r in detail['resources']:
+                          if r.get('ARN'):
+                              acl_arn = r['ARN']
+                              break
 
-                  current_state = {
-                      'regional_acls': regional_acls,
-                      'global_acls': global_acls,
-                      'total_acls': len(regional_acls) + len(global_acls),
-                      'timestamp': timestamp
-                  }
-
+                  # Obtener reglas actuales
+                  new_rules = request_params.get('rules', [])
                   # Leer estado anterior
-                  previous_state = get_previous_state(dynamodb, table_name, account_id)
-                  
-                  # Log resumido para evitar problemas con objetos grandes
-                  if previous_state:
-                      logger.info(f"Previous state: {len(previous_state.get('regional_acls', []))} regional ACLs, {len(previous_state.get('global_acls', []))} global ACLs")
-                  else:
-                      logger.info("Previous state: None (primera ejecución)")
-                  
-                  logger.info(f"Current state: {len(current_state.get('regional_acls', []))} regional ACLs, {len(current_state.get('global_acls', []))} global ACLs")
+                  previous_state = get_previous_acl_state(dynamodb, table_name, str(acl_id))
+                  old_rules = previous_state.get('rules', []) if previous_state else []
+                  # Calcular diferencias
+                  cambios = diff_rules(old_rules, new_rules)
+                  if not cambios:
+                      cambios = ['Sin cambios detectados en las reglas.']
 
-                  # Comparar estados
-                  changed, change_type, details = compare_states(previous_state, current_state)
-                  logger.info(f"Resultado comparación: changed={changed}, change_type={change_type}, details={details}")
+                  # Guardar nuevo estado para el ACL
+                  save_acl_state(dynamodb, table_name, str(acl_id), request_params)
 
-                  # Guardar historial en DynamoDB
-                  save_state(dynamodb, table_name, account_id, timestamp, previous_state, current_state, change_type, details)
-
-                  # Publicar alerta si hay cambios
-                  if changed and sns_topic_arn:
-                      if change_type == 'initial':
-                          message = (
-                              f"Primera ejecución de monitoreo de ACLs de WAF.\n"
-                              f"Total ACLs: {current_state['total_acls']}\n"
-                              f"Timestamp: {timestamp}\n"
-                              f"Cuenta: {account_id}\n"
-                              f"Región: {region}"
-                          )
-                      else:
-                          message = (
-                              f"🚨 Cambio detectado en AWS WAF ACLs\n\n"
-                              f"Detalles de los cambios:\n"
-                              f"{chr(10).join(details.get('changes', []))}\n\n"
-                              f"Total ACLs antes: {len(previous_state.get('regional_acls', [])) + len(previous_state.get('global_acls', [])) if previous_state else 'N/A'}\n"
-                              f"Total ACLs ahora: {current_state['total_acls']}\n"
-                              f"Timestamp: {timestamp}\n"
-                              f"Cuenta: {account_id}\n"
-                              f"Región: {region}"
-                          )
-                      sns.publish(
-                          TopicArn=sns_topic_arn,
-                          Subject="Alerta de cambio en AWS WAF ACL",
-                          Message=message
-                      )
-                      logger.info("Alerta publicada en SNS.")
-                  else:
-                      logger.info("Sin cambios detectados o SNS_TOPIC_ARN no configurado.")
-
-                  return {
-                      'statusCode': 200,
-                      'body': json.dumps({
-                          'changed': changed,
-                          'change_type': change_type,
-                          'details': details,
-                          'current_state': current_state
-                      })
+                  # Guardar historial de evento
+                  account_id = user_identity.get('accountId', 'Desconocido')
+                  timestamp = event_time
+                  item = {
+                      'account_id': {'S': account_id},
+                      'timestamp': {'S': timestamp},
+                      'event_name': {'S': event_name},
+                      'acl_name': {'S': acl_name},
+                      'acl_id': {'S': str(acl_id)},
+                      'acl_scope': {'S': acl_scope},
+                      'acl_arn': {'S': acl_arn or ''},
+                      'user': {'S': user_display},
+                      'user_type': {'S': user_type},
+                      'raw_event': {'S': json.dumps(detail)}
                   }
+                  dynamodb.put_item(TableName=table_name, Item=item)
+
+                  # Construir mensaje SNS
+                  message = (
+                      f"🚨 Cambio detectado en AWS WAF ACL\n\n"
+                      f"Tipo de evento: {event_name}\n"
+                      f"ACL: {acl_name} (ID: {acl_id}, Scope: {acl_scope})\n"
+                      f"ARN: {acl_arn or 'No disponible'}\n"
+                      f"Usuario responsable: {user_display}\n"
+                      f"Tipo de usuario: {user_type}\n"
+                      f"Timestamp: {timestamp}\n"
+                      f"Cuenta: {account_id}\n"
+                      f"Región: {region}\n\n"
+                      f"Cambios detectados en las reglas:\n- " + "\n- ".join(cambios) + "\n"
+                  )
+                  sns.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject="Alerta de cambio en AWS WAF ACL",
+                      Message=message
+                  )
+                  logger.info("Alerta publicada en SNS.")
+                  return {'statusCode': 200, 'body': json.dumps({'message': 'Alerta enviada y guardada en DynamoDB'})}
               except Exception as e:
                   logger.error(f"Excepción inesperada: {e}", exc_info=True)
                   raise
 
-  WAFMonitorRule:
+  WAFMonitorEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub 'waf-acl-monitor-rule-${AWS::StackName}'
-      Description: 'Regla para monitorear cambios en ACLs WAF'
-      ScheduleExpression: !Sub 'rate(${MonitoringInterval} minutes)'
+      Name: !Sub 'waf-acl-monitor-event-rule-${AWS::StackName}'
+      Description: 'Regla para detectar cambios en WAF ACLs via CloudTrail'
+      EventPattern:
+        source:
+          - aws.wafv2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - wafv2.amazonaws.com
+          eventName:
+            - CreateWebACL
+            - UpdateWebACL
+            - DeleteWebACL
       State: ENABLED
       Targets:
         - Arn: !GetAtt WAFMonitorFunction.Arn
@@ -447,7 +289,7 @@ Resources:
       FunctionName: !Ref WAFMonitorFunction
       Action: lambda:InvokeFunction
       Principal: events.amazonaws.com
-      SourceArn: !GetAtt WAFMonitorRule.Arn
+      SourceArn: !GetAtt WAFMonitorEventRule.Arn
 
   WAFACLChangesAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -457,7 +299,7 @@ Resources:
       MetricName: WAFACLChanges
       Namespace: AWS/WAF
       Statistic: Sum
-      Period: !FindInMap [PeriodMap, !Ref MonitoringInterval, Value]
+      Period: 60 # Fijo a 60 segundos para monitoreo por eventos
       EvaluationPeriods: 1
       Threshold: 0
       ComparisonOperator: GreaterThanThreshold
