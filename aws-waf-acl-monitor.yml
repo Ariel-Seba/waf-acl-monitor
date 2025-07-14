@@ -1,0 +1,289 @@
+---
+- name: Monitor AWS WAF ACL Changes and Generate Alerts
+  hosts: localhost
+  gather_facts: true
+  connection: local
+  
+  vars:
+    current_timestamp: "{{ ansible_date_time.iso8601 }}"
+    monitoring_id: "{{ ansible_date_time.epoch }}"
+  
+  pre_tasks:
+    - name: Verificar configuración AWS
+      aws_caller_info:
+        region: "{{ aws_region | default('us-east-1') }}"
+      register: aws_info
+      
+    - name: Obtener información de la cuenta AWS
+      aws_caller_info:
+        region: "{{ aws_region | default('us-east-1') }}"
+      register: caller_info
+      set_fact:
+        aws_account_id: "{{ caller_info.account }}"
+        aws_user_arn: "{{ caller_info.arn }}"
+  
+  tasks:
+    - name: Obtener todos los Web ACLs Regionales
+      aws_wafv2_web_acl_info:
+        region: "{{ aws_region | default('us-east-1') }}"
+        scope: "REGIONAL"
+      register: regional_web_acls
+      
+    - name: Obtener todos los Web ACLs Globales (CloudFront)
+      aws_wafv2_web_acl_info:
+        region: "us-east-1"
+        scope: "CLOUDFRONT"
+      register: global_web_acls
+      
+    - name: Crear estado actual de todos los ACLs
+      set_fact:
+        current_acl_state:
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          account_id: "{{ aws_account_id }}"
+          region: "{{ aws_region | default('us-east-1') }}"
+          regional_acls:
+            count: "{{ regional_web_acls.web_acls | length }}"
+            acls: "{{ regional_web_acls.web_acls }}"
+          global_acls:
+            count: "{{ global_web_acls.web_acls | length }}"
+            acls: "{{ global_web_acls.web_acls }}"
+          total_acls: "{{ (regional_web_acls.web_acls | length) + (global_web_acls.web_acls | length) }}"
+      
+    - name: Verificar si existe estado anterior
+      stat:
+        path: "/tmp/waf_acl_state_previous.yml"
+      register: previous_state_file
+      
+    - name: Cargar estado anterior si existe
+      include_vars:
+        file: "/tmp/waf_acl_state_previous.yml"
+      when: previous_state_file.stat.exists
+      register: previous_acl_state
+      
+    - name: Comparar estados y detectar cambios
+      block:
+        - name: Comparar número total de ACLs
+          set_fact:
+            acl_count_changed: "{{ current_acl_state.total_acls != previous_acl_state.ansible_facts.total_acls }}"
+          when: previous_acl_state.ansible_facts is defined
+          
+        - name: Comparar ACLs Regionales
+          set_fact:
+            regional_acls_changed: "{{ current_acl_state.regional_acls.acls != previous_acl_state.ansible_facts.regional_acls.acls }}"
+          when: previous_acl_state.ansible_facts is defined
+          
+        - name: Comparar ACLs Globales
+          set_fact:
+            global_acls_changed: "{{ current_acl_state.global_acls.acls != previous_acl_state.ansible_facts.global_acls.acls }}"
+          when: previous_acl_state.ansible_facts is defined
+          
+        - name: Detectar cambios específicos
+          set_fact:
+            acl_changes:
+              added_acls: "{{ (current_acl_state.total_acls | int) - (previous_acl_state.ansible_facts.total_acls | int) }}"
+              removed_acls: "{{ (previous_acl_state.ansible_facts.total_acls | int) - (current_acl_state.total_acls | int) }}"
+              regional_changed: "{{ regional_acls_changed | default(false) }}"
+              global_changed: "{{ global_acls_changed | default(false) }}"
+              timestamp: "{{ ansible_date_time.iso8601 }}"
+              account_id: "{{ aws_account_id }}"
+              region: "{{ aws_region | default('us-east-1') }}"
+          when: previous_acl_state.ansible_facts is defined
+          
+        - name: Marcar cambios detectados
+          set_fact:
+            acl_changes_detected: true
+          when: 
+            - previous_acl_state.ansible_facts is defined
+            - (acl_count_changed | default(false)) or (regional_acls_changed | default(false)) or (global_acls_changed | default(false))
+            
+      when: previous_state_file.stat.exists
+      
+    - name: No hay estado anterior - primera ejecución
+      set_fact:
+        acl_changes_detected: false
+        acl_changes:
+          message: "Primera ejecución - no hay estado anterior para comparar"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          account_id: "{{ aws_account_id }}"
+          region: "{{ aws_region | default('us-east-1') }}"
+      when: not previous_state_file.stat.exists
+      
+    - name: Analizar cambios detectados
+      block:
+        - name: Determinar tipo de cambio
+          set_fact:
+            change_type: "unknown"
+          when: acl_changes_detected | default(false)
+          
+        - name: Cambio - ACLs agregados
+          set_fact:
+            change_type: "added"
+            change_description: "Se agregaron {{ acl_changes.added_acls }} ACLs nuevos"
+          when: 
+            - acl_changes_detected | default(false)
+            - acl_changes.added_acls | int > 0
+            
+        - name: Cambio - ACLs eliminados
+          set_fact:
+            change_type: "removed"
+            change_description: "Se eliminaron {{ acl_changes.removed_acls }} ACLs"
+          when: 
+            - acl_changes_detected | default(false)
+            - acl_changes.removed_acls | int > 0
+            
+        - name: Cambio - ACLs Regionales modificados
+          set_fact:
+            change_type: "regional_modified"
+            change_description: "Se modificaron ACLs Regionales"
+          when: 
+            - acl_changes_detected | default(false)
+            - acl_changes.regional_changed | default(false)
+            
+        - name: Cambio - ACLs Globales modificados
+          set_fact:
+            change_type: "global_modified"
+            change_description: "Se modificaron ACLs Globales"
+          when: 
+            - acl_changes_detected | default(false)
+            - acl_changes.global_changed | default(false)
+            
+        - name: Cambio - Múltiples tipos
+          set_fact:
+            change_type: "mixed"
+            change_description: "Múltiples cambios: {{ acl_changes.added_acls }} agregados, {{ acl_changes.removed_acls }} eliminados, regionales: {{ acl_changes.regional_changed }}, globales: {{ acl_changes.global_changed }}"
+          when: 
+            - acl_changes_detected | default(false)
+            - (acl_changes.added_acls | int > 0) and (acl_changes.removed_acls | int > 0)
+            
+        - name: Crear resumen de cambios
+          set_fact:
+            change_summary:
+              account_id: "{{ aws_account_id }}"
+              region: "{{ aws_region | default('us-east-1') }}"
+              change_type: "{{ change_type }}"
+              description: "{{ change_description }}"
+              timestamp: "{{ ansible_date_time.iso8601 }}"
+              details: "{{ acl_changes }}"
+              severity: "{{ 'HIGH' if change_type in ['removed', 'mixed'] else 'MEDIUM' if change_type == 'added' else 'LOW' }}"
+          when: acl_changes_detected | default(false)
+          
+      when: acl_changes is defined
+      
+    - name: Crear SNS Topic para alertas si no existe
+      sns_topic:
+        region: "{{ aws_region | default('us-east-1') }}"
+        name: "waf-acl-alerts"
+        state: present
+      register: sns_topic_info
+      when: acl_changes_detected | default(false)
+      
+    - name: Suscribir emails al SNS Topic
+      sns_topic:
+        region: "{{ aws_region | default('us-east-1') }}"
+        name: "waf-acl-alerts"
+        state: present
+        subscriptions:
+          - protocol: email
+            endpoint: "admin@company.com"
+          - protocol: email
+            endpoint: "security@company.com"
+      when: acl_changes_detected | default(false)
+      
+    - name: Publicar alerta en SNS
+      sns:
+        region: "{{ aws_region | default('us-east-1') }}"
+        topic: "waf-acl-alerts"
+        msg: |
+          🚨 ALERTA AWS WAF ACL - Cambios Detectados
+          
+          Cuenta AWS: {{ change_summary.account_id }}
+          Región: {{ change_summary.region }}
+          Tipo de Cambio: {{ change_summary.change_type | upper }}
+          Severidad: {{ change_summary.severity }}
+          Descripción: {{ change_summary.description }}
+          Timestamp: {{ change_summary.timestamp }}
+          
+          Detalles:
+          - ACLs agregados: {{ change_summary.details.added_acls | default(0) }}
+          - ACLs eliminados: {{ change_summary.details.removed_acls | default(0) }}
+          - ACLs Regionales modificados: {{ change_summary.details.regional_changed | default(false) }}
+          - ACLs Globales modificados: {{ change_summary.details.global_changed | default(false) }}
+          
+          Estado Actual:
+          - Total ACLs: {{ current_acl_state.total_acls }}
+          - ACLs Regionales: {{ current_acl_state.regional_acls.count }}
+          - ACLs Globales: {{ current_acl_state.global_acls.count }}
+          
+          ⚠️ ACCIÓN REQUERIDA: Revisar cambios en ACLs WAF inmediatamente
+        subject: "🚨 AWS WAF ACL Alert - Changes Detected in Account {{ change_summary.account_id }}"
+      when: 
+        - acl_changes_detected | default(false)
+        - change_summary is defined
+        
+    - name: Enviar métrica a CloudWatch
+      cloudwatch_metric:
+        region: "{{ aws_region | default('us-east-1') }}"
+        namespace: "AWS/WAF"
+        name: "WAFACLChanges"
+        value: "{{ 1 if acl_changes_detected | default(false) else 0 }}"
+        unit: "Count"
+        dimensions:
+          AccountID: "{{ aws_account_id }}"
+          Region: "{{ aws_region | default('us-east-1') }}"
+      when: acl_changes_detected | default(false)
+      
+    - name: Crear CloudWatch Alarm para cambios de ACL
+      cloudwatch_metric_alarm:
+        region: "{{ aws_region | default('us-east-1') }}"
+        state: present
+        name: "waf-acl-changes-alarm"
+        metric: "WAFACLChanges"
+        namespace: "AWS/WAF"
+        statistic: "Sum"
+        comparison: "GreaterThanThreshold"
+        threshold: 0
+        period: 300
+        evaluation_periods: 1
+        alarm_actions: "{{ sns_topic_info.sns_arn }}"
+        alarm_description: "Alerta cuando se detectan cambios en ACLs WAF"
+      when: acl_changes_detected | default(false)
+      
+    - name: Guardar estado actual como estado anterior
+      copy:
+        content: "{{ current_acl_state | to_nice_yaml }}"
+        dest: "/tmp/waf_acl_state_previous.yml"
+        mode: '0644'
+  
+  post_tasks:
+    - name: Mostrar resumen del monitoreo
+      debug:
+        msg: |
+          Monitoreo AWS WAF ACL completado:
+          - Cuenta AWS: {{ aws_account_id }}
+          - Región: {{ aws_region | default('us-east-1') }}
+          - Total ACLs: {{ current_acl_state.total_acls }}
+          - ACLs Regionales: {{ current_acl_state.regional_acls.count }}
+          - ACLs Globales: {{ current_acl_state.global_acls.count }}
+          - Cambios detectados: {{ acl_changes_detected | default(false) }}
+          - Timestamp: {{ current_timestamp }}
+          
+    - name: Mostrar cambios si los hay
+      debug:
+        msg: |
+          Cambios detectados en ACLs:
+          {{ change_summary | to_nice_yaml }}
+        level: 1
+      when: acl_changes_detected | default(false)
+      
+    - name: Mostrar ACLs actuales
+      debug:
+        msg: |
+          ACLs Regionales:
+          {% for acl in current_acl_state.regional_acls.acls %}
+          - {{ acl.name }} ({{ acl.id }})
+          {% endfor %}
+          
+          ACLs Globales:
+          {% for acl in current_acl_state.global_acls.acls %}
+          - {{ acl.name }} ({{ acl.id }})
+          {% endfor %} 
