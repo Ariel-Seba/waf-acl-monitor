@@ -122,3 +122,75 @@ Puedes modificar el mensaje de alerta, los campos guardados en DynamoDB o los ev
 ## Soporte
 
 ¿Dudas o mejoras? ¡Abre un issue o contacta al autor! 
+
+## Roles y Permisos
+
+### Rol de ejecución de Lambda (`WAFMonitorRole`)
+
+La solución crea un rol IAM para la función Lambda con los siguientes permisos mínimos necesarios:
+
+- **AWSLambdaBasicExecutionRole**  
+  Permite a la Lambda escribir logs en CloudWatch.
+
+- **Permisos personalizados:**
+  - `wafv2:ListWebACLs`
+  - `wafv2:GetWebACL`
+  - `sns:Publish`
+  - `cloudwatch:PutMetricData`
+  - `logs:CreateLogGroup`
+  - `logs:CreateLogStream`
+  - `logs:PutLogEvents`
+  - `dynamodb:PutItem`
+  - `dynamodb:GetItem`
+  - `dynamodb:Query`
+  - `cloudtrail:LookupEvents` (opcional, solo si la Lambda consulta eventos históricos)
+
+**Scope:**  
+Todos los recursos (`Resource: '*'`), pero se recomienda restringir a los recursos específicos si es posible.
+
+#### Ejemplo YAML del rol IAM
+
+```yaml
+WAFMonitorRole:
+  Type: AWS::IAM::Role
+  Properties:
+    AssumeRolePolicyDocument:
+      Version: '2012-10-17'
+      Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+    ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    Policies:
+      - PolicyName: WAFMonitorPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - wafv2:ListWebACLs
+                - wafv2:GetWebACL
+                - sns:Publish
+                - cloudwatch:PutMetricData
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - cloudtrail:LookupEvents
+              Resource: '*'
+```
+
+### Permiso de invocación Lambda desde EventBridge
+
+- Permite que la regla de EventBridge invoque la función Lambda cuando se detecta un evento relevante de CloudTrail.
+
+### ¿EventBridge necesita un rol para leer CloudTrail?
+
+**No.**  
+EventBridge y CloudTrail están integrados nativamente en AWS.  
+- CloudTrail envía los eventos a EventBridge automáticamente.
+- No es necesario crear un rol adicional para que EventBridge “lea” CloudTrail. 
